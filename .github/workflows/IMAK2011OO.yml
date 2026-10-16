@@ -1,1 +1,161 @@
+name: SILVETON SAMPLER Intel macOS
 
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build-test-package:
+    runs-on: macos-15-intel
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepare project from ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # the source zip lives in the root of the repository (the .github folder is hidden on the Mac)
+          ZIP_PATH="IMAK2011OO.zip"
+          if [ ! -f "$ZIP_PATH" ]; then
+            ZIP_PATH=".github/workflows/IMAK2011OO.zip"
+          fi
+          WORK_DIR="$RUNNER_TEMP/imak2011oo-src"
+
+          if [ ! -f "$ZIP_PATH" ]; then
+            echo "ERROR: Missing IMAK2011OO.zip (put it in the root of the repository)"
+            exit 1
+          fi
+
+          rm -rf "$WORK_DIR"
+          mkdir -p "$WORK_DIR"
+          ditto -x -k "$ZIP_PATH" "$WORK_DIR"
+
+          # the project folder is the one that holds the main CMakeLists.txt (directly or one folder down)
+          PROJECT_DIR=""
+          if [ -f "$WORK_DIR/CMakeLists.txt" ]; then
+            PROJECT_DIR="$WORK_DIR"
+          else
+            for candidate in "$WORK_DIR"/*/; do
+              if [ -f "${candidate}CMakeLists.txt" ] && [ -d "${candidate}core" ]; then
+                PROJECT_DIR="${candidate%/}"
+                break
+              fi
+            done
+          fi
+          if [ -z "${PROJECT_DIR:-}" ] || [ ! -f "$PROJECT_DIR/CMakeLists.txt" ]; then
+            echo "ERROR: Could not locate CMakeLists.txt inside ZIP"
+            find "$WORK_DIR" -maxdepth 3 -print
+            exit 1
+          fi
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+      - name: Configure
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S "$PROJECT_DIR" -B "$PROJECT_DIR/build" \
+            -G Xcode \
+            -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13 \
+            -DIMAK_BUILD_TESTS=ON
+
+      - name: Build app
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --build "$PROJECT_DIR/build" \
+            --config Release \
+            --target SILVETON_SAMPLER
+
+      - name: Build and run tests
+        # the tests report their result in TESTS.txt (it travels with the app); they never stop the app from being delivered
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/silveton-artifact"
+          set +e
+          cmake --build "$PROJECT_DIR/build" \
+            --config Release \
+            --target imak_check 2>&1 | tee "$RUNNER_TEMP/silveton-artifact/TESTS.txt"
+          STATUS=${PIPESTATUS[0]}
+          set -e
+          echo "Test exit code: $STATUS" | tee -a "$RUNNER_TEMP/silveton-artifact/TESTS.txt"
+          exit "$STATUS"
+
+      - name: Locate app
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP_PATH="$(find "$PROJECT_DIR/build" -type d -name 'SILVETON SAMPLER.app' -print -quit)"
+          if [ -z "${APP_PATH:-}" ]; then
+            echo "ERROR: SILVETON SAMPLER.app not found"
+            find "$PROJECT_DIR/build" -maxdepth 5 -print
+            exit 1
+          fi
+
+          EXECUTABLE="$APP_PATH/Contents/MacOS/SILVETON SAMPLER"
+          if [ ! -f "$EXECUTABLE" ]; then
+            echo "ERROR: App executable not found"
+            exit 1
+          fi
+          if [ ! -f "$APP_PATH/Contents/Resources/fonts/Roboto-Regular.ttf" ]; then
+            echo "ERROR: Fonts are missing inside the app"
+            exit 1
+          fi
+
+          echo "APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
+          echo "EXECUTABLE=$EXECUTABLE" >> "$GITHUB_ENV"
+
+      - name: Verify Intel x86_64
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARCHS="$(lipo -archs "$EXECUTABLE")"
+          echo "Architectures: $ARCHS"
+          if [ "$ARCHS" != "x86_64" ]; then
+            echo "ERROR: Expected x86_64 only"
+            exit 1
+          fi
+
+      - name: Verify macOS 10.13 deployment target
+        shell: bash
+        run: |
+          set -euo pipefail
+          otool -l "$EXECUTABLE" | grep -A6 -E 'LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX' || true
+
+      - name: Ad-hoc sign
+        shell: bash
+        run: |
+          set -euo pipefail
+          codesign --force --deep --sign - "$APP_PATH"
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+
+      - name: Package app
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/silveton-artifact"
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$APP_PATH" \
+            "$RUNNER_TEMP/silveton-artifact/SILVETON-SAMPLER-iMac2011-x86_64.zip"
+          shasum -a 256 \
+            "$RUNNER_TEMP/silveton-artifact/SILVETON-SAMPLER-iMac2011-x86_64.zip" \
+            > "$RUNNER_TEMP/silveton-artifact/SHA256.txt"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SILVETON-SAMPLER-iMac2011-x86_64
+          path: |
+            ${{ runner.temp }}/silveton-artifact/SILVETON-SAMPLER-iMac2011-x86_64.zip
+            ${{ runner.temp }}/silveton-artifact/SHA256.txt
+            ${{ runner.temp }}/silveton-artifact/TESTS.txt
+          if-no-files-found: error
